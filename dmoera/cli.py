@@ -284,7 +284,10 @@ def cmd_certify(args) -> int:
     print(f"[dmoera] code hash: {code_hash[:16]}...")
     print(f"[dmoera] uploading to {server} (sealed exam: real thresholds, holdout, attempt ledger) ...")
 
-    body = json.dumps({"code": code, "code_hash": code_hash}).encode()
+    body_obj = {"code": code, "code_hash": code_hash}
+    if args.screen_only:
+        body_obj["cert_mode"] = "screen"
+    body = json.dumps(body_obj).encode()
     req = urllib.request.Request(
         f"{server}/api/package/certify", data=body, method="POST",
         headers={"Content-Type": "application/json",
