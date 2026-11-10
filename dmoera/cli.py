@@ -323,8 +323,104 @@ def cmd_certify(args) -> int:
             print(f"  {label:16s} {res[k]}")
     if res.get("cert_id"):
         print(f"  cert:            {res['cert_id']}")
-        print(f"  verify:          {server}/api/package/certify/verify/{res.get('code_hash', '')}")
-        print(f"  Share the cert line + hash in your README - anyone can verify it.")
+        print(f"  verify page:     {server}/verify/{res.get('code_hash', '')}")
+        print(f"  verify (json):   {server}/api/package/certify/verify/{res.get('code_hash', '')}")
+        b = res.get("battery") or {}
+        if b.get("ok"):
+            bv = b.get("verdict") or {}
+            print(f"  deep battery:    {'ADMITTED' if bv.get('admitted') else 'REJECTED'} "
+                  f"on 6.25y ({bv.get('n_trades')} trades, {bv.get('net_bps_total')} bps net)")
+            for gname, g in (bv.get("gates") or {}).items():
+                if isinstance(g, dict):
+                    mark = "PASS" if g.get("ok") is True else ("FAIL" if g.get("ok") is False else "N/A ")
+                    print(f"    {gname:18s} {mark}")
+        else:
+            print(f"  deep battery:    unavailable ({b.get('error', 'unknown')})")
+        print(f"  Share the verify link in your README - anyone can check it, no account.")
+    return 0
+
+
+
+def cmd_battery(args) -> int:
+    """The 6-gate deep battery on ~6.25 years of 1h bars - the open method
+    behind dMoERA's deep certification lane. Local run = method only (no
+    trial ledger, no sealed holdout); `dmoera certify` is the enforcement."""
+    from datetime import timedelta
+    from dmoera import data as d
+    from dmoera.engine import simulate_strategy
+    from dmoera.gates import evaluate_battery, MIN_TRADES, MIN_TSTAT
+
+    strategy_class = _load_bot_file(args.file)
+    meta = getattr(strategy_class, "METADATA", {}) or {}
+    if args.symbol:
+        symbol = args.symbol.upper()
+    else:
+        parts = meta.get("domain", "eth_usdc").split("_")
+        quote = "USDC" if len(parts) > 1 and parts[1].lower() == "usdc" else "USDT"
+        symbol = parts[0].upper() + quote
+    warmup = int(meta.get("warmup_bars", 0) or 0)
+
+    print(f"[dmoera] loading {args.days}d of 1h candles for {symbol} (big fetch, be patient) ...")
+    candles = d.load_candles(symbol, interval="1h", days=args.days, csv_path=args.csv)
+    n = len(candles)
+    if n < warmup + 500:
+        print(f"[dmoera] not enough candles ({n}) for the battery.")
+        return 1
+    span = candles[-1]["timestamp"] - candles[0]["timestamp"]
+    print(f"[dmoera] {n} candles ({candles[0]['timestamp'].date()} -> {candles[-1]['timestamp'].date()}, "
+          f"{span.days/365.25:.2f} years)")
+    print(f"[dmoera] running the full window (friction {args.friction} bps/side, seed 42) ...")
+
+    s = strategy_class()
+    feats = _maybe_features(strategy_class, Path(args.file).read_text(encoding="utf-8"),
+                            symbol, "1h", candles, args.days)
+    trades_st, _m = simulate_strategy(s, candles, symbol=symbol,
+                                      friction_bps=args.friction, warmup_bars=warmup,
+                                      features_series=feats)
+    bar_s = 3600
+    gtrades = []
+    for t in trades_st:
+        closed = t.timestamp if isinstance(t.timestamp, datetime) else datetime.fromisoformat(str(t.timestamp))
+        opened = closed - timedelta(seconds=bar_s * int(t.hold_bars or 0))
+        gtrades.append({"net_bps": float(t.return_bps),
+                        "opened_at": opened.isoformat(),
+                        "closed_at": closed.isoformat()})
+
+    verdict = evaluate_battery(gtrades, n_trials=1,
+                               staleness_months=args.staleness_months,
+                               research_end=candles[-1]["timestamp"])
+    print()
+    print("+" + "-" * 62 + "+")
+    print("|" + f" DEEP BATTERY (6 gates, {args.days}d of 1h bars)".ljust(62) + "|")
+    print("+" + "-" * 62 + "+")
+    for gname, g in verdict["gates"].items():
+        ok = g.get("ok")
+        mark = "PASS" if ok is True else ("FAIL" if ok is False else "N/A ")
+        detail = ""
+        if gname == "min_trades":
+            detail = f"{g.get('n')}/{g.get('required')} trades"
+        elif gname == "net_tstat":
+            detail = f"t={g.get('tstat')} (need {g.get('required')})"
+        elif gname == "deflated_sharpe":
+            detail = f"DSR={g.get('dsr')} (n_trials={g.get('n_trials')})"
+        elif gname == "regime_split":
+            sp = g.get("specialist") or {}
+            detail = f"{g.get('mode')}: {sp.get('best_regime')} t={sp.get('regime_t')} n={sp.get('regime_n')}"
+        elif gname == "staleness" and ok is not None:
+            detail = f"recent {g.get('n_recent')} trades, {g.get('recent_net_bps')} bps"
+        elif gname in ("pbo", "plateau"):
+            detail = g.get("reason", "")
+        print(f"  [{mark}] {gname:18s} {detail}")
+    print()
+    net = verdict["net_bps_total"]
+    print(f"  net: {_fmt_bps(net)} | trades: {verdict['n_trades']} | "
+          f"win rate: {verdict['win_rate']*100:.1f}% | sharpe(total): {verdict['sharpe_total']}")
+    print(f"  VERDICT: {'ADMITTED' if verdict['admitted'] else 'REJECTED'} "
+          f"(min {MIN_TRADES} trades, t >= {MIN_TSTAT}; plateau/PBO need a variant "
+          f"grid - N/A locally, judgeable on the sealed exam with variants)")
+    if not verdict["admitted"]:
+        print("  Note: local n_trials=1 means no DSR correction - the sealed")
+        print("  exam charges your real attempt count. A local pass is not a cert.")
     return 0
 
 
@@ -363,6 +459,16 @@ def main(argv=None) -> int:
     va.add_argument("--csv", default=None, help="use this OHLCV CSV instead of fetching")
     va.add_argument("--friction", type=float, default=6.0)
     va.set_defaults(func=cmd_validate)
+
+    ba = sub.add_parser("battery", help="6-gate deep battery on ~6.25 years of 1h bars (open method)")
+    ba.add_argument("file", help="path to the strategy .py file")
+    ba.add_argument("--symbol", default=None, help="e.g. ETHUSDT (default: from METADATA.domain)")
+    ba.add_argument("--days", type=int, default=2280, help="history length in days (default 2280 = 6.25y)")
+    ba.add_argument("--csv", default=None, help="use this OHLCV CSV instead of fetching")
+    ba.add_argument("--friction", type=float, default=6.0, help="per-side friction bps (default 6.0)")
+    ba.add_argument("--staleness-months", type=int, default=0,
+                    help="decay check: net >= 0 over the trailing N months (0 = skip)")
+    ba.set_defaults(func=cmd_battery)
 
     ce = sub.add_parser("certify", help="official verdict from the dMoERA sealed exam (needs DMOERA_API_KEY)")
     ce.add_argument("file", help="path to the strategy .py file")

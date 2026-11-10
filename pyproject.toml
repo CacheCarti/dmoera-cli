@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "dmoera"
-version = "0.2.0"
+version = "0.3.0"
 description = "Local backtesting for dMoERA strategies: run every bot in the Crypto-Strategies corpus on your own machine with the exact validation engine, then grade and validate the result."
 readme = "README.md"
 requires-python = ">=3.10"
