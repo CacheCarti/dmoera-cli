@@ -5,6 +5,7 @@ Commands:
                          [--csv FILE] [--friction 6.0] [--export-trades F]
   dmoera grade trades.csv [--fee 12] [--trials 20] [--json]
   dmoera validate bot.py [--days 180]   (7 open stages, public thresholds)
+  dmoera battery bot.py [--days 2280]   (6-gate deep battery on 6.25y of 1h bars)
   dmoera certify bot.py               (official verdict; needs DMOERA_API_KEY)
 """
 import argparse

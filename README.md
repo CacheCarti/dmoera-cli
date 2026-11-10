@@ -22,6 +22,14 @@ at any OHLCV file and you're still in business.
 it did: trades, net return after friction, win rate, significance, drawdown.
 Add `--export-trades trades.csv` and you get the full trade list as a file.
 
+**`dmoera battery bot.py`** is the deep battery: the full 6.25-year window
+on 1h bars, six gates - trade count, net t-stat, deflated Sharpe, regime
+split (bull/crash/recovery/bear), staleness, and plateau/PBO when you bring
+a variant grid. This is the same battery that killed 363 hand-built bots of
+which 211 were net-positive. Locally it runs with no trial ledger
+(n_trials=1), so it is the method, not the enforcement - the sealed exam
+(`dmoera certify`) is where your real attempt count gets charged.
+
 **`dmoera grade trades.csv`** is the lie detector. It takes any trade log,
 yours or one of ours, and grades it S through F after realistic fees. It
 splits your results by market regime, runs 500 random-entry placebo bots
