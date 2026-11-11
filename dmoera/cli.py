@@ -6,7 +6,8 @@ Commands:
   dmoera grade trades.csv [--fee 12] [--trials 20] [--json]
   dmoera validate bot.py [--days 180]   (7 open stages, public thresholds)
   dmoera battery bot.py [--days 2280]   (6-gate deep battery on 6.25y of 1h bars)
-  dmoera certify bot.py               (official verdict; needs DMOERA_API_KEY)
+  dmoera certify bot.py               (sealed 7-stage exam verdict; needs DMOERA_API_KEY)
+  dmoera certify bot.py --deep        (Deep Certify: exam + battery + public cert, 500 CR)
 """
 import argparse
 import sys
@@ -285,7 +286,9 @@ def cmd_certify(args) -> int:
     print(f"[dmoera] uploading to {server} (sealed exam: real thresholds, holdout, attempt ledger) ...")
 
     body_obj = {"code": code, "code_hash": code_hash}
-    if args.screen_only:
+    if getattr(args, "deep", False):
+        body_obj["cert_mode"] = "deep"
+    elif getattr(args, "screen_only", False):
         body_obj["cert_mode"] = "screen"
     body = json.dumps(body_obj).encode()
     req = urllib.request.Request(
@@ -476,6 +479,10 @@ def main(argv=None) -> int:
 
     ce = sub.add_parser("certify", help="official verdict from the dMoERA sealed exam (needs DMOERA_API_KEY)")
     ce.add_argument("file", help="path to the strategy .py file")
+    ce.add_argument("--deep", action="store_true",
+                    help="Deep Certify: exam + 6.25y battery + public cert page with QR (500 CR)")
+    ce.add_argument("--screen-only", action="store_true",
+                    help="explicit: the sealed 7-stage exam only (this is the default)")
     ce.add_argument("--api-key", default=None, help="or set DMOERA_API_KEY env var")
     ce.add_argument("--server", default=None, help="dMoERA API base (default https://dmoera.xyz)")
     ce.set_defaults(func=cmd_certify)

@@ -48,8 +48,14 @@ obviously broken. It is not the real exam.
 dMoERA's servers, where the sealed version runs: the actual thresholds, the
 sealed holdout data, the attempt ledger that catches brute-forcing. You
 need an API key from dmoera.xyz Settings for this one, because it costs
-real compute. The verdict that comes back is bound to your code's hash, so
-you can put it in your README and anyone can verify it later.
+real compute (15 CR, enough to iterate on).
+
+**`dmoera certify bot.py --deep`** is the certification people can check.
+Same sealed exam plus the 6.25-year deep battery on 1h bars, for 500 CR.
+The result becomes a public certificate at dmoera.xyz/verify/<hash> with a
+QR code, bound to your code's exact hash, the data fingerprint and the
+test config. Anyone can open it without an account and confirm the exact
+code that was tested. That is the thing to put in your README.
 
 The short version: `backtest` tells you what a bot did. `grade` tells you
 whether to believe it. `validate` tells you whether it holds up across
