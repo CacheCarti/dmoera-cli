@@ -467,8 +467,16 @@ def _compute_bar_regimes(candles: List[dict], vol_window: int = 24) -> List[Dict
     Returns a list aligned 1:1 with candles, each entry being a market
     context dict with 'regime', 'crisis_score', and 'fear_greed_index'.
     Uses adaptive percentile-based thresholds on returns and volatility.
+
+    Judge v2: thresholds are POINT-IN-TIME — each bar's vol/trend
+    percentiles come from an expanding window of PAST bars only. The v1
+    judge normalized against the full sample, which leaked future
+    distribution info into every ctx.market consumer (found in external
+    audit, 2026-11-11). Bars before enough history exists get neutral
+    labels (no regime information yet).
     """
     import numpy as _np
+    from bisect import insort
 
     log_returns = []
     for i, c in enumerate(candles):
@@ -491,21 +499,36 @@ def _compute_bar_regimes(candles: List[dict], vol_window: int = 24) -> List[Dict
         window = log_returns[max(0, i - vol_window + 1):i + 1]
         rolling_means.append(sum(window) / len(window) if window else 0.0)
 
-    ret_arr = _np.array(log_returns[1:]) if len(log_returns) > 1 else _np.array([0.0])
-    vol_arr = _np.array(vols[vol_window:]) if len(vols) > vol_window else _np.array(vols)
-    vol_p67 = float(_np.percentile(vol_arr, 67)) if len(vol_arr) > 0 else 0.0
-    vol_p33 = float(_np.percentile(vol_arr, 33)) if len(vol_arr) > 0 else 0.0
+    def _nearest_rank(sorted_vals: List[float], q: float) -> Optional[float]:
+        if not sorted_vals:
+            return None
+        k = max(0, min(len(sorted_vals) - 1,
+                       int(round((q / 100.0) * (len(sorted_vals) - 1)))))
+        return sorted_vals[k]
 
-    # Dead-zone threshold for neutral trend: 25th-75th percentile of |mean_ret|
-    abs_means = [abs(m) for m in rolling_means[vol_window:]] if len(rolling_means) > vol_window else [abs(m) for m in rolling_means]
-    neutral_threshold = float(_np.percentile(abs_means, 50)) if abs_means else 0.0
+    # Expanding point-in-time threshold sets (past bars only, current bar
+    # included — its vol/mean are known once the bar closes).
+    vol_sorted: List[float] = []
+    abs_mean_sorted: List[float] = []
+    MIN_THRESHOLD_OBS = 30
 
     regimes = []
     for i in range(len(candles)):
+        if i >= vol_window:
+            insort(vol_sorted, vols[i])
+            insort(abs_mean_sorted, abs(rolling_means[i]))
+
         vol = vols[i]
         mean_ret = rolling_means[i]
 
-        if vol > vol_p67:
+        vol_p67 = _nearest_rank(vol_sorted, 67) if len(vol_sorted) >= MIN_THRESHOLD_OBS else None
+        vol_p33 = _nearest_rank(vol_sorted, 33) if len(vol_sorted) >= MIN_THRESHOLD_OBS else None
+        neutral_threshold = (_nearest_rank(abs_mean_sorted, 50)
+                             if len(abs_mean_sorted) >= MIN_THRESHOLD_OBS else None)
+
+        if vol_p67 is None:
+            vol_label = "normal"
+        elif vol > vol_p67:
             vol_label = "volatile"
         elif vol < vol_p33:
             vol_label = "calm"
@@ -513,7 +536,9 @@ def _compute_bar_regimes(candles: List[dict], vol_window: int = 24) -> List[Dict
             vol_label = "normal"
 
         # Trend classification with neutral dead-zone
-        if abs(mean_ret) < neutral_threshold:
+        if neutral_threshold is None:
+            trend = "neutral"
+        elif abs(mean_ret) < neutral_threshold:
             trend = "neutral"
         elif mean_ret < 0:
             trend = "bear"
@@ -831,7 +856,6 @@ def simulate_strategy(
     features_series: Optional[List[dict]] = None,
     market_series: Optional[List[dict]] = None,
     initial_equity: float = 100.0,
-    exact_friction_bps: Optional[float] = None,
 ) -> Tuple[List[SimTrade], Dict[str, Any]]:
     """Run a strategy over historical candles with realistic simulation.
 
@@ -856,21 +880,12 @@ def simulate_strategy(
         market_series: Optional per-bar market context dicts (regime, crisis_score,
             fear_greed_index), aligned 1:1 with candles. None -> auto-computed.
         initial_equity: Starting equity for compounding (default 100.0)
-        exact_friction_bps: When set, charge exactly this per side (Studio's user-chosen
-            friction) instead of the size-proportional impact model. None = production model.
 
     Returns:
         (trades, metrics_dict)
     """
     rng = random.Random(seed)
-    # Rolling bar history, capped to the SAME 1000-bar window the live worker
-    # exposes (sandbox/live_worker.py MAX_BARS). The uncapped version was an
-    # O(N^2) disaster: `list(bars)` copied the full history on EVERY bar, so a
-    # 137k-bar run spent ~29s per simulation purely on list copies (measured)
-    # — that was the bulk of the old 4m14s certify. Live parity also means
-    # bots can't rely on more than 1000 bars of context in production anyway.
     bars: List[Bar] = []
-    _BARS_CAP = 1000
     trades: List[SimTrade] = []
     returns: List[float] = []
     equity_curve: List[float] = [initial_equity]
@@ -925,10 +940,7 @@ def simulate_strategy(
         direction_mult = 1 if direction == "long" else -1
         gross_bps = ((exit_price - entry) / entry) * 10000 * direction_mult
         pos_size = position["size_usd"]
-        if exact_friction_bps is not None:
-            rt_friction = float(exact_friction_bps) * 2
-        else:
-            rt_friction = _compute_friction_bps(domain_key, pos_size, friction_bps, fee_bps) * 2
+        rt_friction = _compute_friction_bps(domain_key, pos_size, friction_bps, fee_bps) * 2
         net_bps = gross_bps - rt_friction
 
         # PnL scales with POSITION SIZE, not total equity: a 10%-confidence
@@ -955,6 +967,7 @@ def simulate_strategy(
         returns.append(net_bps)
         position = None
 
+    pending_entry = None
     for i, c in enumerate(candles):
         # Build bar with proper timestamp from candle data
         ts = c.get("timestamp")
@@ -974,11 +987,23 @@ def simulate_strategy(
             volume=float(c.get("volume", 0.0)),
         )
         bars.append(bar)
-        if len(bars) > _BARS_CAP:
-            del bars[:-_BARS_CAP]
 
         bar_market = market_series[i] if (market_series and i < len(market_series)) else {}
         bar_regime = bar_market.get("regime", "NORMAL") if bar_market else "NORMAL"
+
+        # ── Judge v2: execute a pending entry at THIS bar's open ──
+        # The signal was decided on the previous bar's close; the honest
+        # fill is the next bar's open, not the signal bar's close.
+        if pending_entry is not None and position is None:
+            position = {
+                **pending_entry,
+                "entry_price": bar.open,
+                "entry_ts": bar_ts,
+                "high_price": bar.open,
+                "low_price": bar.open,
+            }
+            entry_bar_idx = i
+            pending_entry = None
 
         # ── Check exits on open position BEFORE signal processing ──
         # Position was opened on a previous bar, so SL/TP/horizon
@@ -1082,7 +1107,7 @@ def simulate_strategy(
             bot_id="validation",
             symbol=symbol,
             bar=bar,
-            bars=bars,
+            bars=list(bars),
             position=position,
             rng=rng,
             bar_index=i,
@@ -1106,17 +1131,7 @@ def simulate_strategy(
         except Exception as e:
             return trades, {"error": f"Runtime error at bar {i}: {type(e).__name__}: {e}"}
 
-        if signal is None:
-            continue
-        if signal.direction == SignalDirection.FLAT:
-            # Contract v2: "flat" is a real close-any-position signal. The live
-            # adapter passes flat to the engine (sandbox/isolated_bot.py), so
-            # validation must honor it too — dropping it here made long/flat
-            # strategies backtest with exits they don't have live.
-            if position is not None:
-                _close_position(bar.close, "signal_flat", i, bar_ts, bar_regime)
-            continue
-        if not signal.is_active():
+        if signal is None or not signal.is_active():
             continue
 
         new_dir = signal.direction.value
@@ -1125,7 +1140,7 @@ def simulate_strategy(
         if position is not None and position["direction"] != new_dir:
             _close_position(bar.close, "signal_flip", i, bar_ts, bar_regime)
 
-        # Open new position
+        # Open new position — queued for the NEXT bar's open (judge v2).
         if position is None:
             sl_bps = signal.stop_loss_bps if signal.stop_loss_bps is not None else default_sl_bps
             tp_bps = signal.take_profit_bps if signal.take_profit_bps is not None else default_tp_bps
@@ -1133,52 +1148,39 @@ def simulate_strategy(
 
             pos_size = equity * signal.confidence
 
-            position = {
+            pending_entry = {
                 "direction": new_dir,
-                "entry_price": bar.close,
                 "confidence": signal.confidence,
-                "entry_bar": i,
-                "entry_ts": bar_ts,
                 "sl_bps": sl_bps,
                 "tp_bps": tp_bps,
                 "hold_seconds": hold_seconds,
                 "size_usd": pos_size,
                 "entry_reason": (signal.metadata or {}).get("reason", ""),
-                "high_price": bar.close,
-                "low_price": bar.close,
             }
-            entry_bar_idx = i
 
     # Close any remaining position at the end of data
-    last_c = candles[-1] if candles else None
-    if last_c is not None:
-        _last_ts = last_c.get("timestamp")
-        last_bar_ts = _last_ts if isinstance(_last_ts, datetime) else datetime.utcfromtimestamp(float(_last_ts))
     if position is not None:
+        last_bar = bars[-1]
         last_regime = market_series[-1].get("regime", "NORMAL") if market_series else "NORMAL"
-        _close_position(float(last_c["close"]), "end_of_data", len(candles) - 1, last_bar_ts, last_regime)
+        _close_position(last_bar.close, "end_of_data", len(bars) - 1, last_bar.timestamp, last_regime)
 
     metrics = _compute_metrics(returns, trades, equity_curve, initial_equity)
     # Store start timestamp and bar duration for datetime-axis charting
-    # (from `candles`, NOT the capped rolling `bars` window)
-    if candles:
-        first_ts = candles[0].get("timestamp")
-        first_bar_ts = first_ts if isinstance(first_ts, datetime) else datetime.utcfromtimestamp(float(first_ts))
-        metrics["start_timestamp"] = first_bar_ts.isoformat()
-        metrics["end_timestamp"] = last_bar_ts.isoformat()
+    if bars:
+        metrics["start_timestamp"] = bars[0].timestamp.isoformat()
+        metrics["end_timestamp"] = bars[-1].timestamp.isoformat()
     metrics["bar_seconds"] = bar_seconds
     # Bucketed equity shape for the report-card PnL chart — no timestamps,
     # no prices, just the path equity took across the run.
     metrics["pnl_curve"] = [round(e, 4) for e in _bucket_series(equity_curve)]
 
     # Buy-and-hold benchmark: simulate holding the asset for the entire period
-    # (computed from the FULL candle series, not the capped bar window)
-    if len(candles) >= 2:
-        first_close = float(candles[0]["close"])
-        last_close = float(candles[-1]["close"])
+    if len(bars) >= 2:
+        first_close = bars[0].close
+        last_close = bars[-1].close
         bh_return_bps = ((last_close - first_close) / first_close) * 10000.0
         # Build buy-and-hold equity curve (proportional to price)
-        bh_equity = [initial_equity * (float(c["close"]) / first_close) for c in candles]
+        bh_equity = [initial_equity * (b.close / first_close) for b in bars]
         metrics["benchmark_return_bps"] = round(bh_return_bps, 2)
         metrics["benchmark_equity_curve"] = [round(e, 6) for e in _bucket_series(bh_equity)]
         # Excess return (alpha) over buy-and-hold
@@ -1189,3 +1191,6 @@ def simulate_strategy(
         metrics["excess_return_bps"] = round(metrics.get("total_return_bps", 0.0), 2)
 
     return trades, metrics
+
+
+JUDGE_VERSION = "v4"

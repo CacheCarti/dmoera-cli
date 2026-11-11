@@ -17,7 +17,7 @@ WANTED = [
     "_infer_bar_seconds", "_infer_domain_key", "_default_fee_bps",
     "_DEFAULT_FEE_BPS", "_VALIDATION_LENIENCY", "_CURVE_MAX_POINTS", "_bucket_series",
     "_compute_friction_bps", "_compute_bar_regimes", "_compute_metrics",
-    "simulate_strategy",
+    "simulate_strategy", "JUDGE_VERSION",
 ]
 
 lines = src.splitlines(keepends=True)
@@ -72,7 +72,7 @@ order = [
     "_infer_bar_seconds", "_infer_domain_key", "_default_fee_bps",
     "_DEFAULT_FEE_BPS", "_VALIDATION_LENIENCY", "_CURVE_MAX_POINTS", "_bucket_series",
     "_compute_friction_bps", "_compute_bar_regimes", "_compute_metrics",
-    "simulate_strategy",
+    "simulate_strategy", "JUDGE_VERSION",
 ]
 for name in order:
     parts.append(segments[name])
