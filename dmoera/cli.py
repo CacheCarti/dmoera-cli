@@ -84,8 +84,11 @@ def cmd_backtest(args) -> int:
         symbol = parts[0].upper() + quote
     warmup = int(meta.get("warmup_bars", 0) or 0)
 
-    print(f"[dmoera] loading candles: {symbol} {args.interval} last {args.days}d ...")
-    candles = d.load_candles(symbol, interval=args.interval, days=args.days, csv_path=args.csv)
+    win = _date_window(args)
+    print(f"[dmoera] loading candles: {symbol} {args.interval} "
+          f"({win[1]}) ...")
+    candles = d.load_candles(symbol, interval=args.interval, days=args.days,
+                             csv_path=args.csv, **win[0])
     if len(candles) < warmup + 10:
         print(f"[dmoera] not enough candles ({len(candles)}) for warmup {warmup}. "
               f"Use --days or --csv to provide more data.")
@@ -143,7 +146,7 @@ def cmd_grade(args) -> int:
 # These thresholds are PUBLISHED approximations, not the sealed exam's bar.
 # Passing here means "not obviously broken", nothing more.
 
-STAGE_SPLIT = 0.6      # in-sample = first 60%, OOS = last 40%
+STAGE_SPLIT = 0.7      # in-sample = first 70%, OOS = last 30% (server DEFAULT_IN_SAMPLE_RATIO)
 HOLDOUT_FRAC = 0.15    # last 15% is the holdout slice
 WF_WINDOWS = 5         # rolling walk-forward windows
 RANDOM_STARTS = 5      # randomized-start runs
@@ -164,6 +167,15 @@ def _fmt_bps(x):
     return f"{x:+.1f} bps" if x else "0.0 bps"
 
 
+def _date_window(args):
+    """(kwargs for load_candles, human description). --start/--end give a
+    fixed reproducible window; otherwise fall back to --days from today."""
+    if getattr(args, "start", None) and getattr(args, "end", None):
+        return ({"start": args.start, "end": args.end},
+                f"{args.start} -> {args.end}")
+    return ({}, f"last {args.days}d")
+
+
 def cmd_validate(args) -> int:
     from dmoera import data as d
     from dmoera.engine import load_strategy, simulate_strategy
@@ -179,14 +191,18 @@ def cmd_validate(args) -> int:
     warmup = int(meta.get("warmup_bars", 0) or 0)
     friction = args.friction
 
-    print(f"[dmoera] loading candles: {symbol} {args.interval} last {args.days}d ...")
-    candles = d.load_candles(symbol, interval=args.interval, days=args.days, csv_path=args.csv)
+    win = _date_window(args)
+    print(f"[dmoera] loading candles: {symbol} {args.interval} "
+          f"({win[1]}) ...")
+    candles = d.load_candles(symbol, interval=args.interval, days=args.days,
+                             csv_path=args.csv, **win[0])
     n = len(candles)
     if n < warmup + 200:
         print(f"[dmoera] not enough candles ({n}) for the battery. Need ~200+ after warmup.")
         return 1
     print(f"[dmoera] {n} candles ({candles[0]['timestamp'].date()} -> {candles[-1]['timestamp'].date()})")
-    print(f"[dmoera] running the 7 open stages (public thresholds, friction {friction} bps/side) ...\n")
+    print(f"[dmoera] running the 7 open stages (public thresholds, friction {friction} bps/side) ...")
+    print("[dmoera] open approximation of the sealed exam - thresholds differ\n")
 
     code = Path(args.file).read_text(encoding="utf-8")
     feats = _maybe_features(strategy_class, code, symbol, args.interval, candles, args.days)
@@ -203,10 +219,10 @@ def cmd_validate(args) -> int:
     # 1. code safety - load_strategy's static checks already ran in _load_bot_file
     stage("1 code safety", True, "static checks passed (no network, no clock, no file IO)")
 
-    # 2. in-sample
+    # 2. in-sample (smoke test: any trade passes - the real bar is sealed)
     _, m_is = _sim_slice(strategy_class, candles, symbol, warmup, 0, is_end, friction, feats)
     is_bps = m_is.get("total_return_bps", 0.0)
-    stage("2 in-sample", m_is.get("total_trades", 0) > 0,
+    stage("2 in-sample (smoke test)", m_is.get("total_trades", 0) > 0,
           f"{m_is.get('total_trades', 0)} trades, {_fmt_bps(is_bps)}")
 
     # 3. out-of-sample
@@ -232,18 +248,21 @@ def cmd_validate(args) -> int:
     rng = _random.Random(20261109)
     rs_rets = []
     rsize = max(warmup + 50, int(n * 0.2))
+    # Windows must end before the holdout slice so the "never used above"
+    # claim on stage 7 is actually true.
     for _ in range(RANDOM_STARTS):
-        lo = rng.randint(0, max(0, n - rsize - 1))
+        lo = rng.randint(0, max(0, holdout_start - rsize))
         _, m_r = _sim_slice(strategy_class, candles, symbol, warmup, lo, lo + rsize, friction, feats)
         rs_rets.append(m_r.get("total_return_bps", 0.0))
     rs_med = sorted(rs_rets)[len(rs_rets) // 2]
     stage("5 randomized starts", rs_med > 0,
           f"median of {RANDOM_STARTS} random windows: {_fmt_bps(rs_med)}")
 
-    # 6. slippage stress: OOS again at 2x friction
+    # 6. slippage stress: OOS again at 2x friction (local stand-in for the
+    # server's perturbation stage)
     _, m_st = _sim_slice(strategy_class, candles, symbol, warmup, is_end, oos_end, friction * STRESS_MULT, feats)
     st_bps = m_st.get("total_return_bps", 0.0)
-    stage("6 slippage stress", st_bps > 0,
+    stage("6 slippage stress (local stand-in for perturbation)", st_bps > 0,
           f"OOS at {friction * STRESS_MULT:.0f} bps/side: {_fmt_bps(st_bps)}")
 
     # 7. holdout - reported, never tuned against
@@ -290,12 +309,14 @@ def cmd_certify(args) -> int:
         body_obj["cert_mode"] = "deep"
     elif getattr(args, "screen_only", False):
         body_obj["cert_mode"] = "screen"
+    from dmoera import __version__ as _cli_version
+    ua = f"dmoera-cli/{_cli_version}"
     body = json.dumps(body_obj).encode()
     req = urllib.request.Request(
         f"{server}/api/package/certify", data=body, method="POST",
         headers={"Content-Type": "application/json",
                  "Authorization": f"Bearer {api_key}",
-                 "User-Agent": "dmoera-cli/0.2"})
+                 "User-Agent": ua})
     try:
         with urllib.request.urlopen(req, timeout=600) as r:
             res = json.load(r)
@@ -320,31 +341,112 @@ def cmd_certify(args) -> int:
     if not res.get("success"):
         print(f"[dmoera] certify failed: {res.get('error', 'unknown error')}")
         return 1
+
+    certified = res.get("certified")
+    verdict = res.get("verdict")
+    battery_src = res.get("battery")
+    jr = None
+
+    # Deep certify is a durable server-side job: the POST returns a job id
+    # immediately and the sealed exam + 6.25y battery finish in the
+    # background. Poll the job endpoint until it lands.
+    if res.get("async") and res.get("job_id"):
+        import time as _time
+        job_id = res["job_id"]
+        print(f"[dmoera] queued as job {job_id} - the sealed exam + deep battery")
+        print("         run on our servers (usually a few minutes). Polling ...")
+        deadline = _time.time() + 5400
+        while _time.time() < deadline:
+            poll_req = urllib.request.Request(
+                f"{server}/api/creator/validation-jobs/{job_id}",
+                headers={"Authorization": f"Bearer {api_key}",
+                         "User-Agent": ua})
+            try:
+                with urllib.request.urlopen(poll_req, timeout=60) as r:
+                    poll = json.load(r)
+            except Exception as e:
+                print(f"[dmoera] poll failed ({e}) - retrying ...")
+                _time.sleep(10)
+                continue
+            st = poll.get("status")
+            if st == "done":
+                jr = poll.get("result") or {}
+                break
+            if st in ("error", "not_found"):
+                perr = poll.get("error")
+                if isinstance(poll.get("result"), dict):
+                    perr = perr or poll["result"].get("error")
+                print(f"[dmoera] certification job failed: {perr or st}")
+                return 1
+            _time.sleep(10)
+        else:
+            print("[dmoera] timed out waiting for the certification job.")
+            print(f"         Check later: {server}/verify/{res.get('code_hash', '')}")
+            return 1
+        certified = jr.get("certified", certified)
+        verdict = jr.get("verdict") or verdict
+        if verdict is None and isinstance(jr.get("success"), bool):
+            # Non-deep async jobs return the raw exam result, not a cert
+            # verdict - map success onto the same words the sync path uses.
+            verdict = ("PASSED" if jr["success"]
+                       else f"FAILED at {jr.get('failed_at') or 'unknown'}")
+        # The job result carries the verdict; the public verify record
+        # carries the battery detail (flat fields, same as the cert page).
+        try:
+            with urllib.request.urlopen(
+                    f"{server}/api/package/certify/verify/{res.get('code_hash', '')}",
+                    timeout=60) as r:
+                vres = json.load(r)
+            if vres.get("success"):
+                battery_src = (vres.get("summary") or {}).get("battery") or battery_src
+        except Exception:
+            pass
+
     print()
     print("+" + "-" * 62 + "+")
-    print("|" + f" OFFICIAL VERDICT   {res.get('verdict', '?')}   attempt #{res.get('attempt', '?')}".ljust(62) + "|")
+    print("|" + f" OFFICIAL VERDICT   {verdict or '?'}".ljust(62) + "|")
     print("+" + "-" * 62 + "+")
+    show = jr if jr else res
+    rep_summ = ((show.get("report") or {}).get("summary")) or {}
     for k, label in (("oos_return_bps", "OOS return"), ("sharpe", "Sharpe"),
                      ("max_drawdown_bps", "Max drawdown"), ("total_trades", "Trades")):
-        if k in res:
-            print(f"  {label:16s} {res[k]}")
-    if res.get("cert_id"):
-        print(f"  cert:            {res['cert_id']}")
-        print(f"  verify page:     {server}/verify/{res.get('code_hash', '')}")
-        print(f"  verify (json):   {server}/api/package/certify/verify/{res.get('code_hash', '')}")
-        b = res.get("battery") or {}
-        if b.get("ok"):
-            bv = b.get("verdict") or {}
-            print(f"  deep battery:    {'ADMITTED' if bv.get('admitted') else 'REJECTED'} "
-                  f"on 6.25y ({bv.get('n_trades')} trades, {bv.get('net_bps_total')} bps net)")
-            for gname, g in (bv.get("gates") or {}).items():
+        v = show.get(k)
+        if v is None:
+            alt = {"sharpe": "oos_sharpe",
+                   "max_drawdown_bps": "oos_max_drawdown_bps",
+                   "total_trades": "oos_trades"}.get(k, k)
+            v = rep_summ.get(alt)
+        if v is not None:
+            print(f"  {label:16s} {v}")
+    if show.get("stages_passed") is not None:
+        print(f"  {'exam stages':16s} {show.get('stages_passed')}/{show.get('stages_total', 7)}")
+    if show.get("validation_score") is not None:
+        print(f"  {'validation score':16s} {show.get('validation_score')}")
+    if show.get("failed_at"):
+        print(f"  {'failed at':16s} {show.get('failed_at')}")
+    for reason in (show.get("verdict_reasons") or []):
+        print(f"  reason: {reason}")
+    code_hash = res.get("code_hash") or (jr or {}).get("code_hash") or ""
+    cert_id = res.get("cert_id") or (jr or {}).get("cert_id")
+    if cert_id:
+        if cert_id:
+            print(f"  cert:            {cert_id}")
+        print(f"  verify page:     {server}/verify/{code_hash}")
+        print(f"  verify (json):   {server}/api/package/certify/verify/{code_hash}")
+        b = battery_src or {}
+        if b.get("skipped"):
+            print("  deep battery:    skipped (screen-only certification)")
+        elif b.get("admitted") is not None or b.get("gates"):
+            print(f"  deep battery:    {'ADMITTED' if b.get('admitted') else 'REJECTED'} "
+                  f"on 6.25y ({b.get('n_trades')} trades, {b.get('net_bps_total')} bps net)")
+            for gname, g in (b.get("gates") or {}).items():
                 if isinstance(g, dict):
                     mark = "PASS" if g.get("ok") is True else ("FAIL" if g.get("ok") is False else "N/A ")
                     print(f"    {gname:18s} {mark}")
-        else:
+        elif b:
             print(f"  deep battery:    unavailable ({b.get('error', 'unknown')})")
         print(f"  Share the verify link in your README - anyone can check it, no account.")
-    return 0
+    return 0 if certified is not False else 1
 
 
 
@@ -367,8 +469,22 @@ def cmd_battery(args) -> int:
         symbol = parts[0].upper() + quote
     warmup = int(meta.get("warmup_bars", 0) or 0)
 
-    print(f"[dmoera] loading {args.days}d of 1h candles for {symbol} (big fetch, be patient) ...")
-    candles = d.load_candles(symbol, interval="1h", days=args.days, csv_path=args.csv)
+    # Window: the server's research window by default (2020-01-01 ->
+    # 2026-04-01, fixed dates so runs reproduce). --days still works as an
+    # explicit override (counts back from today).
+    if args.days is not None:
+        win = {"days": args.days}
+        win_desc = f"last {args.days}d"
+    else:
+        win = {"start": args.start, "end": args.end}
+        win_desc = f"{args.start} -> {args.end}"
+    friction = args.friction
+    if friction is None:
+        # Server FRICTION_PER_SIDE: BTC/ETH 6.0, SOL 7.0 bps per side.
+        friction = 7.0 if "sol" in symbol.lower() else 6.0
+
+    print(f"[dmoera] loading 1h candles for {symbol} ({win_desc}, big fetch, be patient) ...")
+    candles = d.load_candles(symbol, interval="1h", csv_path=args.csv, **win)
     n = len(candles)
     if n < warmup + 500:
         print(f"[dmoera] not enough candles ({n}) for the battery.")
@@ -376,19 +492,21 @@ def cmd_battery(args) -> int:
     span = candles[-1]["timestamp"] - candles[0]["timestamp"]
     print(f"[dmoera] {n} candles ({candles[0]['timestamp'].date()} -> {candles[-1]['timestamp'].date()}, "
           f"{span.days/365.25:.2f} years)")
-    print(f"[dmoera] running the full window (friction {args.friction} bps/side, seed 42) ...")
+    print(f"[dmoera] running the battery window (friction {friction} bps/side, seed 42) ...")
 
     s = strategy_class()
     feats = _maybe_features(strategy_class, Path(args.file).read_text(encoding="utf-8"),
-                            symbol, "1h", candles, args.days)
+                            symbol, "1h", candles, args.days or 0)
     trades_st, _m = simulate_strategy(s, candles, symbol=symbol,
-                                      friction_bps=args.friction, warmup_bars=warmup,
+                                      friction_bps=friction, warmup_bars=warmup,
                                       features_series=feats)
     bar_s = 3600
     gtrades = []
     for t in trades_st:
-        closed = t.timestamp if isinstance(t.timestamp, datetime) else datetime.fromisoformat(str(t.timestamp))
-        opened = closed - timedelta(seconds=bar_s * int(t.hold_bars or 0))
+        # t.timestamp is the ENTRY (signal) bar time; the exit is
+        # hold_bars bars later. Same convention as _write_trades_csv.
+        opened = t.timestamp if isinstance(t.timestamp, datetime) else datetime.fromisoformat(str(t.timestamp))
+        closed = opened + timedelta(seconds=bar_s * max(1, int(t.hold_bars or 0)))
         gtrades.append({"net_bps": float(t.return_bps),
                         "opened_at": opened.isoformat(),
                         "closed_at": closed.isoformat()})
@@ -398,7 +516,8 @@ def cmd_battery(args) -> int:
                                research_end=candles[-1]["timestamp"])
     print()
     print("+" + "-" * 62 + "+")
-    print("|" + f" DEEP BATTERY (6 gates, {args.days}d of 1h bars)".ljust(62) + "|")
+    print("|" + f" DEEP BATTERY (6 gates, {win_desc} of 1h bars)".ljust(62) + "|")
+    print("|" + " approximate local check - not the official certificate".ljust(62) + "|")
     print("+" + "-" * 62 + "+")
     for gname, g in verdict["gates"].items():
         ok = g.get("ok")
@@ -442,6 +561,8 @@ def main(argv=None) -> int:
     bt.add_argument("--interval", default="5m",
                     choices=["1m", "3m", "5m", "15m", "30m", "1h", "2h", "4h", "1d"])
     bt.add_argument("--days", type=int, default=180, help="history length (default 180)")
+    bt.add_argument("--start", default=None, help="fixed window start YYYY-MM-DD (with --end, overrides --days)")
+    bt.add_argument("--end", default=None, help="fixed window end YYYY-MM-DD, exclusive (with --start)")
     bt.add_argument("--csv", default=None, help="use this OHLCV CSV instead of fetching")
     bt.add_argument("--friction", type=float, default=6.0,
                     help="per-side friction in bps (default 6.0)")
@@ -463,6 +584,8 @@ def main(argv=None) -> int:
     va.add_argument("--interval", default="5m",
                     choices=["1m", "3m", "5m", "15m", "30m", "1h", "2h", "4h", "1d"])
     va.add_argument("--days", type=int, default=180)
+    va.add_argument("--start", default=None, help="fixed window start YYYY-MM-DD (with --end, overrides --days)")
+    va.add_argument("--end", default=None, help="fixed window end YYYY-MM-DD, exclusive (with --start)")
     va.add_argument("--csv", default=None, help="use this OHLCV CSV instead of fetching")
     va.add_argument("--friction", type=float, default=6.0)
     va.set_defaults(func=cmd_validate)
@@ -470,9 +593,15 @@ def main(argv=None) -> int:
     ba = sub.add_parser("battery", help="6-gate deep battery on ~6.25 years of 1h bars (open method)")
     ba.add_argument("file", help="path to the strategy .py file")
     ba.add_argument("--symbol", default=None, help="e.g. ETHUSDT (default: from METADATA.domain)")
-    ba.add_argument("--days", type=int, default=2280, help="history length in days (default 2280 = 6.25y)")
+    ba.add_argument("--start", default="2020-01-01",
+                    help="window start YYYY-MM-DD (default 2020-01-01, the server research window)")
+    ba.add_argument("--end", default="2026-04-01",
+                    help="window end YYYY-MM-DD, exclusive (default 2026-04-01)")
+    ba.add_argument("--days", type=int, default=None,
+                    help="override: last N days from today instead of --start/--end")
     ba.add_argument("--csv", default=None, help="use this OHLCV CSV instead of fetching")
-    ba.add_argument("--friction", type=float, default=6.0, help="per-side friction bps (default 6.0)")
+    ba.add_argument("--friction", type=float, default=None,
+                    help="per-side friction bps (default: 6.0 BTC/ETH, 7.0 SOL - the server's model)")
     ba.add_argument("--staleness-months", type=int, default=0,
                     help="decay check: net >= 0 over the trailing N months (0 = skip)")
     ba.set_defaults(func=cmd_battery)

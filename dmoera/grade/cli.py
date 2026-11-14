@@ -41,7 +41,7 @@ def render(r: dict) -> str:
     out.append(f"  Max drawdown      {_pct(sel['max_drawdown'], False)}")
     out.append(f"  Sharpe (annual)   {sel['sharpe']:.2f}")
     out.append(f"  Beats random bots {sel['placebo_pct']:.0f}% of {s['placebo_bots']}")
-    out.append(f"  Deflated Sharpe   {sel['deflated_sharpe'] * 100:.0f}%  (assuming {r['trials']} tries)")
+    out.append(f"  Probabilistic Sharpe {sel.get('probabilistic_sharpe', sel.get('deflated_sharpe', 0)) * 100:.0f}%  (assuming {r['trials']} tries)")
     be = s["break_even_fee_bps"]
     out.append(f"  Edge dies at      {be:.1f} bps round trip" if be > 0 else "  Edge dies at      0 bps (no edge even before fees)")
     if sel["caps"]:

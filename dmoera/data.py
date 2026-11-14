@@ -37,7 +37,9 @@ INTERVAL_MS = {
     "1d": 86_400_000,
 }
 
-_UA = {"User-Agent": "dmoera/0.2 (+https://github.com/CacheCarti/dmoera-cli)"}
+from dmoera import __version__ as _VERSION
+
+_UA = {"User-Agent": f"dmoera/{_VERSION} (+https://github.com/CacheCarti/dmoera-cli)"}
 
 
 def _ts_to_datetime(ts_ms: float) -> datetime:
@@ -260,24 +262,40 @@ def _coverage(candles: List[dict], interval: str) -> Tuple[int, int, int]:
 def load_candles(symbol: str, interval: str = "5m",
                  days: int = 180,
                  csv_path: Optional[str] = None,
-                 quiet: bool = False) -> List[dict]:
+                 quiet: bool = False,
+                 start=None, end=None) -> List[dict]:
     """Load candles for a symbol, cache-first with head+tail backfill.
 
     csv_path: use this OHLCV file instead of any network source.
-    days: how much history to load. The cache grows to cover whatever has
-    been requested before; missing head or tail ranges are fetched.
+    days: how much history to load, ending now. The cache grows to cover
+    whatever has been requested before; missing head or tail ranges are
+    fetched.
+    start/end: explicit window (datetime or "YYYY-MM-DD", UTC). When both
+    are given they replace `days` — use these for reproducible runs.
+    `end` is exclusive, matching the server's research window semantics.
     """
     if csv_path:
         return load_csv(csv_path)
-    if days <= 0:
+    if days <= 0 and start is None:
         raise ValueError("days must be positive")
+
+    def _as_dt(v):
+        if isinstance(v, datetime):
+            return v.replace(tzinfo=None)
+        return datetime.fromisoformat(str(v)[:10])
 
     def warn(msg: str) -> None:
         if not quiet:
             print(f"[dmoera] {msg}")
 
-    end_ms = int(datetime.now(timezone.utc).timestamp() * 1000)
-    start_ms = end_ms - days * 86_400_000
+    if end is not None:
+        end_ms = _naive_to_ms(_as_dt(end))
+    else:
+        end_ms = int(datetime.now(timezone.utc).timestamp() * 1000)
+    if start is not None:
+        start_ms = _naive_to_ms(_as_dt(start))
+    else:
+        start_ms = end_ms - days * 86_400_000
     step = INTERVAL_MS.get(interval, 300_000)
     path = _cache_path(symbol, interval)
     cached = _read_cache(path) or []

@@ -20,11 +20,11 @@ from datetime import datetime, timedelta
 from statistics import NormalDist
 from typing import Dict, List, Optional, Tuple
 
-REGIME_PERIODS: List[Tuple[str, int, int]] = [
+REGIME_PERIODS: List[Tuple[str, float, float]] = [
     ("2020-21_bull", 2020, 2022),
     ("2022_crash", 2022, 2023),
     ("2023-24_recovery", 2023, 2025),
-    ("2025-26_bear", 2025, 2026),
+    ("2025-26_bear", 2025, 2026.25),
 ]
 
 MIN_TRADES = 50
@@ -78,6 +78,26 @@ def deflated_sharpe_ratio(observed_sharpe: float, n_trades: int,
         return 0.0
     effective_sharpe = observed_sharpe / math.sqrt(variance_factor)
     return round(effective_sharpe - expected_max_sharpe_under_null(n_trials), 4)
+
+
+def _skew(xs: List[float]) -> float:
+    """Population skewness — same formula as the server battery."""
+    n = len(xs)
+    mean = sum(xs) / n
+    sd = math.sqrt(sum((x - mean) ** 2 for x in xs) / n)
+    if sd == 0:
+        return 0.0
+    return sum((x - mean) ** 3 for x in xs) / n / sd ** 3
+
+
+def _kurtosis(xs: List[float]) -> float:
+    """Raw (non-excess) kurtosis, normal = 3 — same formula as the server."""
+    n = len(xs)
+    mean = sum(xs) / n
+    sd = math.sqrt(sum((x - mean) ** 2 for x in xs) / n)
+    if sd == 0:
+        return 3.0
+    return sum((x - mean) ** 4 for x in xs) / n / sd ** 4
 
 
 def _year(ts) -> int:
@@ -168,17 +188,10 @@ def evaluate_battery(trades: List[dict], n_trials: int = 1,
         sd = math.sqrt(sum((x - mean) ** 2 for x in xs) / (n - 1))
         if sd > 0:
             sharpe_total = mean / sd * math.sqrt(n)
-    # distribution shape for the DSR haircut
-    skew = 0.0
-    kurt = 3.0
-    if n >= 3:
-        m = mean
-        s2 = sum((x - m) ** 2 for x in xs) / (n - 1)
-        s3 = sum((x - m) ** 3 for x in xs) / (n - 1)
-        s4 = sum((x - m) ** 4 for x in xs) / (n - 1)
-        if s2 > 0:
-            skew = (s3 / s2 ** 1.5) * math.sqrt(n * (n - 1)) / (n - 2) if n > 2 else 0.0
-            kurt = s4 / s2 ** 2 if s2 > 0 else 3.0
+    # distribution shape for the DSR haircut — population moments,
+    # identical to factory/admission_gates._skew/_kurtosis
+    skew = _skew(xs) if n >= 3 else 0.0
+    kurt = _kurtosis(xs) if n >= 4 else 3.0
     dsr = deflated_sharpe_ratio(sharpe_total, n, max(1, n_trials),
                                 skewness=skew, kurtosis=kurt)
 

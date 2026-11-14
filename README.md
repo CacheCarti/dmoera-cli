@@ -23,18 +23,21 @@ it did: trades, net return after friction, win rate, significance, drawdown.
 Add `--export-trades trades.csv` and you get the full trade list as a file.
 
 **`dmoera battery bot.py`** is the deep battery: the full 6.25-year window
-on 1h bars, six gates - trade count, net t-stat, deflated Sharpe, regime
+on 1h bars (2020-01-01 to 2026-04-01, fixed dates so runs reproduce), six
+gates - trade count, net t-stat, deflated Sharpe, regime
 split (bull/crash/recovery/bear), staleness, and plateau/PBO when you bring
 a variant grid. This is the same battery that killed 363 hand-built bots of
 which 211 were net-positive. Locally it runs with no trial ledger
 (n_trials=1), so it is the method, not the enforcement - the sealed exam
-(`dmoera certify`) is where your real attempt count gets charged.
+(`dmoera certify`) is where your real attempt count gets charged. It is an
+approximate local check: the engine matches, the data feed and a few
+server-side details can still differ, so a local pass is not a certificate.
 
 **`dmoera grade trades.csv`** is the lie detector. It takes any trade log,
 yours or one of ours, and grades it S through F after realistic fees. It
-splits your results by market regime, runs 500 random-entry placebo bots
-against yours, and computes a deflated Sharpe so a lucky streak can't
-pretend to be skill. It reads TradingView, Freqtrade and Binance exports
+splits your results by market regime, runs up to 500 random-entry placebo
+bots against yours (the cap drops for very large logs), and computes a
+probabilistic Sharpe so a lucky streak can't pretend to be skill. It reads TradingView, Freqtrade and Binance exports
 too, so you can bring results from other tools and still get a straight
 answer.
 
@@ -52,7 +55,10 @@ real compute (15 CR, enough to iterate on).
 
 **`dmoera certify bot.py --deep`** is the certification people can check.
 Same sealed exam plus the 6.25-year deep battery on 1h bars, for 500 CR.
-The result becomes a public certificate at dmoera.xyz/verify/<hash> with a
+The exam runs as a server-side job, so the command polls until it lands
+(usually a few minutes) and prints the real verdict - CERTIFIED, FAILED or
+INCOMPLETE - plus the per-gate battery breakdown. The result becomes a
+public certificate at dmoera.xyz/verify/<hash> with a
 QR code, bound to your code's exact hash, the data fingerprint and the
 test config. Anyone can open it without an account and confirm the exact
 code that was tested. That is the thing to put in your README.
@@ -64,13 +70,18 @@ windows it didn't pick. `certify` is the only result that counts.
 ## Reproducing the corpus numbers
 
 Every report card in the Crypto-Strategies repo came out of this engine.
-To check a card's claim yourself:
+To check a card's claim yourself, run the bot over the same window the
+card used - `--start`/`--end` take fixed dates so the result doesn't
+drift as time passes:
 
 ```
-dmoera backtest strategies/<bot>.py --interval 5m --days 180
-dmoera backtest strategies/<bot>.py --interval 5m --days 180 --export-trades t.csv
+dmoera backtest strategies/<bot>.py --interval 5m --start 2025-01-01 --end 2025-07-01
+dmoera backtest strategies/<bot>.py --interval 5m --start 2025-01-01 --end 2025-07-01 --export-trades t.csv
 dmoera grade t.csv
 ```
+
+For byte-exact reproduction, export the card's OHLCV window to a CSV and
+pass `--csv` instead - that skips the data fetch entirely.
 
 Cross-asset strategies that read `ctx.features` work locally too. Open
 interest and positioning come from Binance's public metrics archive, and

@@ -52,7 +52,7 @@ def norm_ppf(p: float) -> float:
            (((((b[0] * r + b[1]) * r + b[2]) * r + b[3]) * r + b[4]) * r + 1)
 
 
-def deflated_sharpe(returns, trials: int) -> dict:
+def probabilistic_sharpe(returns, trials: int) -> dict:
     """Probability that the true per-trade Sharpe is above the best you'd expect from `trials` tries of pure luck."""
     n = len(returns)
     if n < 3:
@@ -277,9 +277,9 @@ def _score(m, n, span_days, placebo_pct, dsr, n_assessed, n_profitable, best_sha
     elif m["max_drawdown"] > 0.5:
         cap(49.9, f"Worst drawdown was {m['max_drawdown']:.0%}.")
     if dsr < 0.5:
-        cap(49.9, f"Deflated Sharpe is {dsr:.0%}: little evidence the edge is real after {trials} tries.")
+        cap(49.9, f"Probabilistic Sharpe is {dsr:.0%}: little evidence the edge is real after {trials} tries.")
     elif dsr < 0.95:
-        cap(79.9, f"Deflated Sharpe is {dsr:.0%}, short of the 95% needed for S.")
+        cap(79.9, f"Probabilistic Sharpe is {dsr:.0%}, short of the 95% needed for S.")
     if placebo_pct < 80:
         cap(64.9, f"Beats only {placebo_pct:.0f}% of {n_placebo} random-entry bots making the same trades.")
     elif placebo_pct < 95:
@@ -343,7 +343,7 @@ def audit(trades, fee_bps: float = DEFAULT_FEE_BPS, trials: int = DEFAULT_TRIALS
         ties = bisect.bisect_right(totals, real) - below
         placebo_pct = 100.0 * (below + 0.5 * ties) / len(totals)
         q = lambda x: math.exp(totals[min(len(totals) - 1, int(x * len(totals)))]) - 1  # noqa: E731
-        ds = deflated_sharpe(net, trials)
+        ds = probabilistic_sharpe(net, trials)
         reg_rows, n_assessed, n_profitable, best_share, best = _regime_table(labels, net)
         score, pillars, raw, caps = _score(m, n, span_days, placebo_pct, ds["dsr"], n_assessed, n_profitable,
                                            best_share, best, f, trials, n_placebo)
@@ -355,7 +355,7 @@ def audit(trades, fee_bps: float = DEFAULT_FEE_BPS, trials: int = DEFAULT_TRIALS
             "max_drawdown": m["max_drawdown"], "sharpe": m["sharpe"],
             "placebo_pct": placebo_pct,
             "placebo_quantiles": {"p5": q(0.05), "p50": q(0.5), "p95": q(0.95)},
-            "deflated_sharpe": ds["dsr"], "sharpe_per_trade": ds["sharpe_per_trade"],
+            "probabilistic_sharpe": ds["dsr"], "deflated_sharpe": ds["dsr"], "sharpe_per_trade": ds["sharpe_per_trade"],
             "sharpe_benchmark": ds["benchmark"],
             "regimes": reg_rows, "regimes_profitable": n_profitable, "regimes_assessed": n_assessed,
             "best_regime_share": best_share,
