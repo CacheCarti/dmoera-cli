@@ -4,7 +4,7 @@ Runs the exact simulation engine the dMoERA validation harness uses, on your
 own machine, against Binance data you cache locally (or any OHLCV CSV you
 bring). Every bot in the Crypto-Strategies corpus runs unmodified.
 """
-__version__ = "0.4.1"
+__version__ = "0.4.2"
 
 import sys as _sys
 import types as _types

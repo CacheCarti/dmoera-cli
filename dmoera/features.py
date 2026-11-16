@@ -193,19 +193,21 @@ def _load_metrics(symbol: str, coin: str, start: datetime, end: datetime) -> Dic
 # ── the builder ──────────────────────────────────────────────────────────────
 
 def build_feature_series(candles: List[dict], code: str, symbol: str,
-                         interval: str = "5m", quiet: bool = False) -> Optional[List[dict]]:
+                         interval: str = "5m", quiet: bool = False):
     """Per-bar feature dicts aligned 1:1 with candles, trimmed to the keys the
-    strategy reads. Returns None when the strategy reads no features at all
-    (same as production: a featureless bot ships no features)."""
+    strategy reads. Returns (series, missing) where series is None when the
+    strategy reads no features at all (same as production: a featureless bot
+    ships no features) and missing lists every requested key that could not
+    be served locally (they read as the strategy's default, usually 0.0)."""
     def warn(msg: str) -> None:
         if not quiet:
             print(f"[dmoera] {msg}")
 
     keys = used_feature_keys(code)
     if keys is not None and not keys:
-        return None  # featureless bot
+        return None, []  # featureless bot
     if not candles:
-        return None
+        return None, []
     if keys is None:
         # Fail-safe, same as production: unresolvable keying ships ALL
         # servable features rather than risking silent starvation.
@@ -290,6 +292,13 @@ def build_feature_series(candles: List[dict], code: str, symbol: str,
                 served.add(key)
 
     unserved = sorted((keys or set()) - served)
+    missing: List[str] = []
+    for sym in sorted(failed_refs):
+        missing.append(f"{sym} reference candles unavailable (its return keys read as the strategy's default)")
+    for sym in sorted(failed_metrics):
+        missing.append(f"{sym} metrics archive unavailable (its positioning keys read as the strategy's default)")
+    for k in unserved:
+        missing.append(f"feature key '{k}' not available locally (reads as the strategy's default)")
     if failed_refs:
         warn(f"reference candles unavailable for: {', '.join(sorted(failed_refs))} "
              f"(their return keys read as the strategy's default)")
@@ -300,7 +309,7 @@ def build_feature_series(candles: List[dict], code: str, symbol: str,
         warn(f"{len(unserved)} feature key(s) not available locally - "
              f"they read as the strategy's default (usually 0.0)")
     if not sources:
-        return None
+        return None, missing
 
     # merge per bar (later sources don't overlap keys - each key has one source)
     series: List[dict] = []
@@ -311,4 +320,4 @@ def build_feature_series(candles: List[dict], code: str, symbol: str,
             if v is not None:
                 d[src.key] = v
         series.append(d)
-    return series
+    return series, missing

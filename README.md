@@ -89,6 +89,31 @@ reference-asset returns (the `btc_return_*` family) are computed from the
 reference asset's own candles. If a feature can't be served locally, the
 run tells you which keys fell back to defaults instead of failing silently.
 
+## Fee model (read this before comparing engines)
+
+Friction is charged per side on the ENTRY notional: entering and exiting
+both pay `friction_bps × entry_price × size`, regardless of the exit
+price. Some other engines charge the exit fee on the exit value instead,
+which differs slightly when price moved between entry and exit (e.g. a
+500-unit position entered at 60,000 and exited at 60,600 pays an exit fee
+of 0.300 here vs 0.303 there). Neither is wrong - they are different
+conventions - but if you are diffing trade-by-trade against another
+backtester, align this first or the last decimal will never match.
+
+## Running bots locally: what the safety checks are and are not
+
+`dmoera validate` and `backtest` run a static denylist over bot code
+(banned imports like socket/os/subprocess, banned attribute access,
+dunder traversal). That is a lint, NOT a sandbox. It does not stop
+`datetime.now()`, infinite loops, or resource exhaustion - determinism
+and resource limits are enforced on dMoERA's servers, not by this
+package.
+
+If you are running someone else's bot locally, do it the way you would
+run any untrusted script: inside a container or VM, with network access
+disabled and CPU/memory limits set. The checks here exist to catch
+accidents, not adversaries.
+
 ## Why the numbers here mean something
 
 Most local backtesters drift from whatever runs in production. Different

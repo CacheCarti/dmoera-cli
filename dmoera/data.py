@@ -108,7 +108,7 @@ def _merge(old: List[dict], new: List[dict]) -> List[dict]:
 
 
 def _window(candles: List[dict], start_ms: int, end_ms: int) -> List[dict]:
-    return [c for c in candles if start_ms <= _naive_to_ms(c["timestamp"]) <= end_ms]
+    return [c for c in candles if start_ms <= _naive_to_ms(c["timestamp"]) < end_ms]
 
 
 def _parse_kline_row(parts) -> Optional[dict]:
@@ -259,30 +259,69 @@ def _coverage(candles: List[dict], interval: str) -> Tuple[int, int, int]:
     return mss[0], mss[-1], gaps
 
 
+def _validate_candles(candles: List[dict], source: str = "csv") -> List[str]:
+    """OHLCV sanity checks. Returns human-readable issue strings (empty = clean).
+
+    Catches the classic bad-import failure modes: impossible candles
+    (high < low or high/low not bracketing open/close), duplicate
+    timestamps, and missing volume silently read as zero.
+    """
+    issues: List[str] = []
+    if not candles:
+        return issues
+    seen: set = set()
+    dups = 0
+    bad_ohlc = 0
+    no_vol = 0
+    for c in candles:
+        ts = c["timestamp"]
+        if ts in seen:
+            dups += 1
+        seen.add(ts)
+        hi, lo = c["high"], c["low"]
+        if hi < lo or hi < max(c["open"], c["close"]) - 1e-9 or lo > min(c["open"], c["close"]) + 1e-9:
+            bad_ohlc += 1
+        if not c.get("volume"):
+            no_vol += 1
+    if bad_ohlc:
+        issues.append(f"{bad_ohlc} candle(s) with impossible OHLC (high < low, or high/low "
+                      f"not bracketing open/close) - check the source data")
+    if dups:
+        issues.append(f"{dups} duplicate timestamp(s) - later rows were kept as-is, "
+                      f"results may double-count bars")
+    if no_vol == len(candles):
+        issues.append("no volume column data at all - volume-based logic will see 0")
+    elif no_vol:
+        issues.append(f"{no_vol} candle(s) missing volume, treated as 0")
+    return issues
+
+
 def load_candles(symbol: str, interval: str = "5m",
                  days: int = 180,
                  csv_path: Optional[str] = None,
                  quiet: bool = False,
-                 start=None, end=None) -> List[dict]:
+                 start=None, end=None,
+                 strict: bool = False) -> List[dict]:
     """Load candles for a symbol, cache-first with head+tail backfill.
 
-    csv_path: use this OHLCV file instead of any network source.
+    csv_path: use this OHLCV file instead of any network source. start/end
+    are applied to CSV loads too (previously they were ignored).
     days: how much history to load, ending now. The cache grows to cover
     whatever has been requested before; missing head or tail ranges are
     fetched.
     start/end: explicit window (datetime or "YYYY-MM-DD", UTC). When both
     are given they replace `days` — use these for reproducible runs.
     `end` is exclusive, matching the server's research window semantics.
+    strict: raise ValueError on any data-quality issue instead of warning.
     """
-    if csv_path:
-        return load_csv(csv_path)
-    if days <= 0 and start is None:
-        raise ValueError("days must be positive")
-
     def _as_dt(v):
         if isinstance(v, datetime):
             return v.replace(tzinfo=None)
-        return datetime.fromisoformat(str(v)[:10])
+        s = str(v).strip().replace("Z", "+00:00")
+        dt = datetime.fromisoformat(s)
+        if dt.tzinfo is not None:
+            dt = dt.astimezone(timezone.utc).replace(tzinfo=None)
+        return dt
 
     def warn(msg: str) -> None:
         if not quiet:
@@ -296,6 +335,21 @@ def load_candles(symbol: str, interval: str = "5m",
         start_ms = _naive_to_ms(_as_dt(start))
     else:
         start_ms = end_ms - days * 86_400_000
+
+    if csv_path:
+        candles = load_csv(csv_path, strict=strict, quiet=quiet)
+        n0 = len(candles)
+        candles = _window(candles, start_ms, end_ms)
+        if not candles and n0:
+            warn(f"requested window lies entirely outside the CSV data "
+                 f"({n0} candles loaded, none inside the window) - returning empty list")
+        elif len(candles) < n0:
+            warn(f"date window applied to CSV: kept {len(candles)} of {n0} candles")
+        return candles
+
+    if days <= 0 and start is None:
+        raise ValueError("days must be positive")
+
     step = INTERVAL_MS.get(interval, 300_000)
     path = _cache_path(symbol, interval)
     cached = _read_cache(path) or []
@@ -351,11 +405,20 @@ def load_candles(symbol: str, interval: str = "5m",
     return merged
 
 
-def load_csv(path: str) -> List[dict]:
+def load_csv(path: str, strict: bool = False, quiet: bool = False) -> List[dict]:
     """Load any OHLCV CSV: timestamp,open,high,low,close[,volume].
 
-    Timestamps may be unix ms/s or ISO strings. Oldest-first output.
+    Timestamps may be unix ms/s or ISO strings. Timezone offsets in ISO
+    timestamps are converted to UTC (previously they were silently dropped,
+    shifting bars by the offset). Oldest-first output.
+
+    Data-quality issues (impossible OHLC, duplicate timestamps, missing
+    volume) produce warnings; strict=True raises ValueError instead.
     """
+    def warn(msg: str) -> None:
+        if not quiet:
+            print(f"[dmoera] {msg}")
+
     out: List[dict] = []
     with open(path, newline="") as f:
         reader = csv.reader(f)
@@ -364,6 +427,7 @@ def load_csv(path: str) -> List[dict]:
         return out
     header = [h.strip().lower() for h in rows[0]]
     has_header = "open" in header and "close" in header
+    has_vol_col = "volume" in header
     cols = {name: i for i, name in enumerate(header)} if has_header else {
         "timestamp": 0, "open": 1, "high": 2, "low": 3, "close": 4, "volume": 5}
     data = rows[1:] if has_header else rows
@@ -376,12 +440,23 @@ def load_csv(path: str) -> List[dict]:
             dt = (_ts_to_datetime(ts) if ts > 1e11
                   else _ts_to_datetime(ts * 1000))
         except ValueError:
-            dt = datetime.fromisoformat(raw_ts.replace("Z", "+00:00")).replace(tzinfo=None)
-        vol = float(row[cols["volume"]]) if "volume" in cols and len(row) > cols["volume"] else 0.0
+            dt = datetime.fromisoformat(raw_ts.replace("Z", "+00:00"))
+            if dt.tzinfo is not None:
+                dt = dt.astimezone(timezone.utc).replace(tzinfo=None)
+        vol = 0.0
+        if has_vol_col and len(row) > cols["volume"] and str(row[cols["volume"]]).strip():
+            vol = float(row[cols["volume"]])
         out.append({
             "timestamp": dt,
             "open": float(row[cols["open"]]), "high": float(row[cols["high"]]),
             "low": float(row[cols["low"]]), "close": float(row[cols["close"]]),
             "volume": vol,
         })
-    return sorted(out, key=lambda c: c["timestamp"])
+    out.sort(key=lambda c: c["timestamp"])
+    issues = _validate_candles(out, source="csv")
+    if issues:
+        if strict:
+            raise ValueError(f"{path}: " + "; ".join(issues))
+        for msg in issues:
+            warn(f"{path}: {msg}")
+    return out

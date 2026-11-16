@@ -18,6 +18,7 @@ import io
 import json
 import re
 from datetime import datetime, timezone
+from typing import Optional
 
 MAX_TRADES = 20000
 
@@ -140,33 +141,65 @@ SYMBOL = ("symbol", "pair", "ticker", "market", "instrument", "coin", "contract"
 SIDE = ("side", "direction", "type", "position", "position side", "is_short")
 
 
-def _row_to_trade(d: dict):
+def _row_to_trade(d: dict, stats: Optional[dict] = None, strict: bool = False):
     d = _lower_keys(d)
     ep, xp = _num(_pick(d, *ENTRY_P)), _num(_pick(d, *EXIT_P))
     if not ep or not xp or ep <= 0 or xp <= 0:
+        if strict:
+            missing = "entry_price" if not ep else "exit_price"
+            raise ParseError(
+                f"strict mode: row is missing a usable {missing} "
+                f"(still-open or malformed trade) - refusing to guess")
+        if stats is not None and ep and not xp:
+            stats["open_dropped"] += 1
         return None
     side = _side(d["is_short"]) if "is_short" in d else _side(_pick(d, *SIDE))
     if side is None:
+        if strict:
+            raise ParseError("strict mode: row has no side/direction column - refusing to assume LONG")
         side = 1
+        if stats is not None:
+            stats["inferred_side"] += 1
     et = _ts(_pick(d, *ENTRY_T))
     xt = _ts(_pick(d, *EXIT_T))
     if et is None and xt is None:
+        if strict:
+            raise ParseError("strict mode: row has no usable timestamp")
         return None
     if et is None:
         et = xt
     if xt is None or xt < et:
+        if strict:
+            raise ParseError("strict mode: row is missing a valid exit time after entry - refusing to infer it")
         xt = None  # filled in later from the next trade
+        if stats is not None:
+            stats["inferred_exit"] += 1
     size = _num(_pick(d, *SIZE))
+    if not size:
+        if strict:
+            raise ParseError("strict mode: row has no size/qty column - refusing to assume 1.0")
+        size = 1.0
+        if stats is not None:
+            stats["inferred_size"] += 1
     return {"symbol": norm_symbol(_pick(d, *SYMBOL)), "side": side, "entry_time": et, "exit_time": xt,
-            "entry_price": ep, "exit_price": xp, "size": abs(size) if size else 1.0}
+            "entry_price": ep, "exit_price": xp, "size": abs(size)}
 
 
-def _fill_exit_times(trades):
+# Economic columns a log may carry that the grader does NOT use (it grades
+# from prices). Surfaced as warnings so supplied costs are never silently
+# ignored without the user knowing.
+_ECONOMIC_COLS = {"fee", "fees", "commission", "net_return", "return", "pnl",
+                  "profit", "realized", "funding", "funding_fee", "swap"}
+
+
+def _fill_exit_times(trades, stats: Optional[dict] = None):
     trades.sort(key=lambda t: t["entry_time"])
     gaps = [b["entry_time"] - a["entry_time"] for a, b in zip(trades, trades[1:]) if b["entry_time"] > a["entry_time"]]
     typical = sorted(gaps)[len(gaps) // 2] if gaps else 3600.0
     for i, t in enumerate(trades):
         if t["exit_time"] is None:
+            if stats is not None:
+                stats["inferred_exit"] += 1
             nxt = trades[i + 1]["entry_time"] if i + 1 < len(trades) else None
             t["exit_time"] = nxt if nxt and nxt > t["entry_time"] else t["entry_time"] + typical
     return trades
@@ -254,7 +287,7 @@ def _binance_fills(rows):
     return trades
 
 
-def _freqtrade(obj):
+def _freqtrade(obj, stats: Optional[dict] = None, strict: bool = False):
     trades_src = None
     if isinstance(obj, dict) and isinstance(obj.get("strategy"), dict):
         best = max(obj["strategy"].values(), key=lambda s: len((s or {}).get("trades") or []), default=None)
@@ -272,18 +305,24 @@ def _freqtrade(obj):
             d["entry_time"] = d["open_timestamp"]
         if "close_timestamp" in d:
             d["exit_time"] = d["close_timestamp"]
-        t = _row_to_trade(d)
+        t = _row_to_trade(d, stats, strict)
         if t:
             out.append(t)
     return out
 
 
-def parse_any(text: str, filename: str = ""):
-    """Return (trades, format_name, warnings)."""
+def parse_any(text: str, filename: str = "", strict: bool = False):
+    """Return (trades, format_name, warnings).
+
+    Permissive by default: missing sides, sizes and exit times are inferred
+    and reported in `warnings`. strict=True raises ParseError instead of
+    inferring anything.
+    """
     if not text or not text.strip():
         raise ParseError("The file is empty.")
     text = text.lstrip("﻿")
     warnings = []
+    stats = {"inferred_side": 0, "inferred_size": 0, "inferred_exit": 0, "open_dropped": 0}
     stripped = text.lstrip()
     fmt = None
     if stripped[:1] in "{[":
@@ -291,14 +330,14 @@ def parse_any(text: str, filename: str = ""):
             obj = json.loads(stripped)
         except json.JSONDecodeError as e:
             raise ParseError(f"Could not read the JSON: {e.msg} (line {e.lineno}).")
-        trades = _freqtrade(obj)
+        trades = _freqtrade(obj, stats, strict)
         if trades is not None:
             fmt = "Freqtrade backtest JSON"
         else:
             rows = obj if isinstance(obj, list) else obj.get("trades") if isinstance(obj, dict) else None
             if not isinstance(rows, list):
                 raise ParseError("JSON must be a Freqtrade backtest result or a list of trades.")
-            trades = [t for t in (_row_to_trade(r) for r in rows if isinstance(r, dict)) if t]
+            trades = [t for t in (_row_to_trade(r, stats, strict) for r in rows if isinstance(r, dict)) if t]
             fmt = "JSON trade list"
     else:
         rows = _read_csv(text)
@@ -306,7 +345,7 @@ def parse_any(text: str, filename: str = ""):
         if any(c.startswith("trade #") for c in cols) and "type" in cols:
             trades, fmt = _tradingview(rows), "TradingView Strategy Tester CSV"
         elif cols & set(ENTRY_P) and cols & set(EXIT_P):
-            trades = [t for t in (_row_to_trade(r) for r in rows) if t]
+            trades = [t for t in (_row_to_trade(r, stats, strict) for r in rows) if t]
             fmt = "Binance position history CSV" if "closed vol" in cols or "opened" in cols else "Trade list CSV"
         elif "side" in cols and "price" in cols and cols & {"quantity", "executed", "qty", "amount"}:
             trades, fmt = _binance_fills(rows), "Binance Futures trade history CSV"
@@ -315,10 +354,25 @@ def parse_any(text: str, filename: str = ""):
             raise ParseError(
                 "Unrecognized columns. Expected a TradingView or Binance export, a Freqtrade JSON, "
                 "or columns: timestamp, side, entry_price, exit_price, size.")
+        economic = sorted(cols & _ECONOMIC_COLS)
+        if economic:
+            warnings.append(
+                f"column(s) {', '.join(economic)} were read but NOT used - grading comes "
+                f"from entry/exit prices with the --fee model, not from the log's own "
+                f"cost fields")
     if not trades:
         raise ParseError(f"Read the file as {fmt}, but found no complete trades.")
     if len(trades) > MAX_TRADES:
         warnings.append(f"Only the first {MAX_TRADES:,} trades were graded.")
         trades = sorted(trades, key=lambda t: t["entry_time"])[:MAX_TRADES]
-    trades = _fill_exit_times(trades)
+    trades = _fill_exit_times(trades, stats)
+    if stats["inferred_side"]:
+        warnings.append(f"side not given for {stats['inferred_side']} trade(s); assumed LONG")
+    if stats["inferred_size"]:
+        warnings.append(f"size not given for {stats['inferred_size']} trade(s); assumed 1.0")
+    if stats["inferred_exit"]:
+        warnings.append(f"exit time inferred from the next trade's entry for "
+                        f"{stats['inferred_exit']} trade(s)")
+    if stats["open_dropped"]:
+        warnings.append(f"{stats['open_dropped']} still-open trade(s) (no exit price) were omitted")
     return trades, fmt, warnings

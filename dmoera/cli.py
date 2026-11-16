@@ -59,14 +59,32 @@ def _resolve_symbol(args) -> str:
 
 
 def _maybe_features(strategy_class, code: str, symbol: str, interval: str,
-                    candles, days: int) -> Optional[list]:
-    """Build the local feature series if the bot reads ctx.features."""
+                    candles, days: int):
+    """Build the local feature series if the bot reads ctx.features.
+    Returns (feats_or_None, missing_keys) - missing_keys lists every
+    requested feature that could not be served locally."""
     from dmoera.features import build_feature_series, used_feature_keys
     keys = used_feature_keys(code)
     if keys is not None and not keys:
-        return None
+        return None, []
     print("[dmoera] bot reads ctx.features - building local feature series ...")
     return build_feature_series(candles, code, symbol, interval)
+
+
+def _data_incomplete_banner(missing) -> None:
+    """Loud DATA_INCOMPLETE report so missing features never masquerade as
+    a zero-trade 'failed' strategy."""
+    if not missing:
+        return
+    print()
+    print("  DATA_INCOMPLETE - this run is missing input data, which is NOT "
+          "the same as a failed strategy:")
+    for m in missing:
+        print(f"    - {m}")
+    print("  Affected bars read the strategy's default values (usually 0.0). "
+          "Treat these results as unreliable for any bot that reads "
+          "ctx.features.")
+    print()
 
 
 def cmd_backtest(args) -> int:
@@ -97,7 +115,8 @@ def cmd_backtest(args) -> int:
           f"({candles[0]['timestamp'].date()} -> {candles[-1]['timestamp'].date()})")
 
     code = Path(args.file).read_text(encoding="utf-8")
-    feats = _maybe_features(strategy_class, code, symbol, args.interval, candles, args.days)
+    feats, missing_feats = _maybe_features(strategy_class, code, symbol, args.interval, candles, args.days)
+    _data_incomplete_banner(missing_feats)
 
     strategy = strategy_class()
     trades, metrics = simulate_strategy(
@@ -205,7 +224,8 @@ def cmd_validate(args) -> int:
     print("[dmoera] open approximation of the sealed exam - thresholds differ\n")
 
     code = Path(args.file).read_text(encoding="utf-8")
-    feats = _maybe_features(strategy_class, code, symbol, args.interval, candles, args.days)
+    feats, missing_feats = _maybe_features(strategy_class, code, symbol, args.interval, candles, args.days)
+    _data_incomplete_banner(missing_feats)
 
     holdout_start = int(n * (1 - HOLDOUT_FRAC))
     oos_end = holdout_start
@@ -217,7 +237,8 @@ def cmd_validate(args) -> int:
         print(f"  [{'PASS' if ok else 'FAIL'}] {name}: {detail}")
 
     # 1. code safety - load_strategy's static checks already ran in _load_bot_file
-    stage("1 code safety", True, "static checks passed (no network, no clock, no file IO)")
+    stage("1 code safety", True,
+          "denylist static checks passed - NOT a sandbox (see README: local execution)")
 
     # 2. in-sample (smoke test: any trade passes - the real bar is sealed)
     _, m_is = _sim_slice(strategy_class, candles, symbol, warmup, 0, is_end, friction, feats)
@@ -495,8 +516,9 @@ def cmd_battery(args) -> int:
     print(f"[dmoera] running the battery window (friction {friction} bps/side, seed 42) ...")
 
     s = strategy_class()
-    feats = _maybe_features(strategy_class, Path(args.file).read_text(encoding="utf-8"),
+    feats, missing_feats = _maybe_features(strategy_class, Path(args.file).read_text(encoding="utf-8"),
                             symbol, "1h", candles, args.days or 0)
+    _data_incomplete_banner(missing_feats)
     trades_st, _m = simulate_strategy(s, candles, symbol=symbol,
                                       friction_bps=friction, warmup_bars=warmup,
                                       features_series=feats)
