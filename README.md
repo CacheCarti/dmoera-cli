@@ -139,3 +139,7 @@ for `certify`. One key, both tools.
 ## License
 
 MIT
+
+## Acknowledgements
+
+Bug reports, Nov 2026, by [u/Ok_Map5721](https://www.reddit.com/user/Ok_Map5721/): regime-threshold lookahead in `_compute_bar_regimes`, same-bar-close entry fills, rsi_div_eth_v45 lows/RSI index misalignment.
